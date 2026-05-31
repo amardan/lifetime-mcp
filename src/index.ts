@@ -107,13 +107,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 // Playwright helper functions
+let browserInstance: any = null;
+
+async function getBrowser(): Promise<any> {
+  if (!browserInstance) {
+    const headless = process.env.LIFETIME_HEADLESS !== "false";
+    browserInstance = await chromium.launch({ headless });
+  }
+  return browserInstance;
+}
+
 async function getBrowserContext(): Promise<{ browser: any; context: BrowserContext }> {
-  const headless = process.env.LIFETIME_HEADLESS !== "false";
-  const browser = await chromium.launch({ headless });
+  const browser = await getBrowser();
   
   let context: BrowserContext;
-  if (fs.existsSync(STATE_FILE)) {
-    context = await browser.newContext({ storageState: STATE_FILE });
+  let stateExists = false;
+  try {
+    stateExists = fs.existsSync(STATE_FILE) && fs.statSync(STATE_FILE).size > 0;
+  } catch (e) {
+    stateExists = false;
+  }
+
+  if (stateExists) {
+    try {
+      context = await browser.newContext({ storageState: STATE_FILE });
+    } catch (contextError) {
+      console.error("Error creating context with storageState, falling back to clean context:", contextError);
+      context = await browser.newContext();
+    }
   } else {
     context = await browser.newContext();
   }
@@ -155,9 +176,21 @@ async function ensureLoggedIn(page: Page) {
     await page.waitForURL("**/my.lifetime.life/**", { timeout: 30000 });
     await page.waitForLoadState("networkidle");
     
-    // Save storage state for next time
-    await page.context().storageState({ path: STATE_FILE });
-    console.error("Login successful, session saved to state.json");
+    // Save storage state for next time atomically
+    const tempStateFile = `${STATE_FILE}.tmp`;
+    try {
+      await page.context().storageState({ path: tempStateFile });
+      fs.renameSync(tempStateFile, STATE_FILE);
+      console.error("Login successful, session saved to state.json");
+    } catch (saveError) {
+      console.error("Error saving storage state atomically, attempting direct save:", saveError);
+      try {
+        await page.context().storageState({ path: STATE_FILE });
+        console.error("Login successful, session saved directly to state.json");
+      } catch (directSaveError) {
+        console.error("Failed to save session state:", directSaveError);
+      }
+    }
   } else {
     console.error("Already logged in (session restored).");
   }
@@ -320,20 +353,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       console.error("Clicking Reserve...");
       await page.click('button:has-text("Reserve"), input[type="submit"][value="Reserve"], button.btn-primary');
       
-      // Wait for success confirmation or modals
-      await page.waitForTimeout(3000);
-      
       // Handle confirm/yes modal if it pops up
       const yesButton = page.locator('button:has-text("Yes"), .modal btn-primary:has-text("Yes")');
-      if (await yesButton.isVisible()) {
+      try {
+        await yesButton.waitFor({ state: "visible", timeout: 4000 });
         await yesButton.click();
-        await page.waitForTimeout(3000);
+      } catch (e) {
+        // Ignore if yes button didn't appear
       }
       
       const okButton = page.locator('button:has-text("OK"), #limitedAccessModalCloseButton');
-      if (await okButton.isVisible()) {
+      try {
+        await okButton.waitFor({ state: "visible", timeout: 2000 });
         await okButton.click();
-        await page.waitForTimeout(2000);
+        await page.waitForLoadState("networkidle");
+      } catch (e) {
+        // Ignore if OK button didn't appear
       }
       
       // Capture result confirmation page/text
@@ -465,11 +500,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       
       // Confirm cancellation
-      await page.waitForTimeout(3000);
       const confirmButton = page.locator('button:has-text("Yes"), button:has-text("Confirm"), button:has-text("OK")');
-      if (await confirmButton.isVisible()) {
+      try {
+        await confirmButton.waitFor({ state: "visible", timeout: 5000 });
         await confirmButton.click();
-        await page.waitForTimeout(2000);
+        await page.waitForLoadState("networkidle");
+      } catch (e) {
+        // Ignore if confirmation dialog didn't appear
       }
       
       return {
@@ -488,7 +525,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   } finally {
     await context.close();
-    await browser.close();
   }
 });
 
@@ -508,8 +544,18 @@ async function main() {
       const transport = new SSEServerTransport("/messages", res);
       transports.set(transport.sessionId, transport);
       
+      const keepAliveInterval = setInterval(() => {
+        try {
+          res.write(": ping\n\n");
+        } catch (err) {
+          console.error(`Error sending keep-alive to session ${transport.sessionId}:`, err);
+          clearInterval(keepAliveInterval);
+        }
+      }, 30000); // 30 seconds
+      
       res.on("close", () => {
         console.error(`SSE connection closed for session: ${transport.sessionId}`);
+        clearInterval(keepAliveInterval);
         transports.delete(transport.sessionId);
       });
       
@@ -536,6 +582,22 @@ async function main() {
     console.error("Lifetime Fitness MCP server running on stdio");
   }
 }
+
+async function shutdown() {
+  console.error("Shutting down Lifetime Fitness MCP server...");
+  if (browserInstance) {
+    try {
+      await browserInstance.close();
+      console.error("Browser closed successfully.");
+    } catch (e) {
+      console.error("Error closing browser:", e);
+    }
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
 main().catch((error) => {
   console.error("Fatal error in main:", error);
