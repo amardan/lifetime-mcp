@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+build/
+
+# Local configuration and credentials
+.env
+
+# Session persistence state (contains active session cookies!)
+state.json
+
+# OS files
+.DS_Store
